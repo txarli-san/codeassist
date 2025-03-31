@@ -32,33 +32,43 @@ func (c *OllamaClient) GenerateResponse(query string, entities []parsers.Entity)
 	// Build prompt with context
 	prompt := buildPromptWithContext(query, entities)
 
-	// Create request body
+	// Create request body - add stream: false to explicitly disable streaming
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"model":  c.model,
 		"prompt": prompt,
+		"stream": false, // Explicitly disable streaming
 	})
 	if err != nil {
 		return "", err
 	}
 
+	fmt.Printf("Using Ollama model: %s\n", c.model)
+	fmt.Println("Sending request to Ollama...")
+
+	// Increase timeout for large responses
+	client := &http.Client{
+		Timeout: 5 * time.Minute, // Much longer timeout for complex queries
+	}
+
 	// Make API request
-	resp, err := c.client.Post(fmt.Sprintf("%s/api/generate", c.baseURL),
+	resp, err := client.Post(fmt.Sprintf("%s/api/generate", c.baseURL),
 		"application/json", bytes.NewBuffer(reqBody))
 	if err != nil {
-		return "", err
+		return fmt.Sprintf("Error connecting to Ollama: %v\nMake sure Ollama is running on %s", err, c.baseURL), err
 	}
 	defer resp.Body.Close()
 
 	// Parse response
 	var result map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
+		return fmt.Sprintf("Error parsing Ollama response: %v", err), err
 	}
 
 	// Extract response text
 	response, ok := result["response"].(string)
 	if !ok {
-		return "", fmt.Errorf("unexpected response format")
+		return fmt.Sprintf("Unexpected response format from Ollama"),
+			fmt.Errorf("unexpected response format")
 	}
 
 	return response, nil
