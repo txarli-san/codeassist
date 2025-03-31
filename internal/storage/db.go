@@ -3,6 +3,7 @@ package storage
 import (
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -290,22 +291,52 @@ func (db *DB) StoreWholeFile(path, language string, modTime int64, content strin
 func (db *DB) FindRelevantFiles(query string, limit int) ([]map[string]interface{}, error) {
 	keywords := strings.Fields(strings.ToLower(query))
 
-	var whereClause strings.Builder
-	whereClause.WriteString("WHERE ")
+	// Build a SELECT query with relevance scoring
+	var sb strings.Builder
+	sb.WriteString(`
+        WITH relevance AS (
+            SELECT
+                wf.path,
+                wf.language,
+                wf.content,
+                (`)
 
+	// Add scoring criteria
 	for i, keyword := range keywords {
 		if i > 0 {
-			whereClause.WriteString(" OR ")
+			sb.WriteString(" + ")
 		}
-		whereClause.WriteString(fmt.Sprintf("(LOWER(path) LIKE '%%%s%%' OR LOWER(content) LIKE '%%%s%%')",
-			keyword, keyword))
+
+		escapedKeyword := strings.ReplaceAll(keyword, "'", "''")
+
+		// Path matches are highly relevant (x3)
+		sb.WriteString(fmt.Sprintf(`
+            CASE WHEN LOWER(wf.path) LIKE '%%%s%%' THEN 3 ELSE 0 END +`, escapedKeyword))
+
+		// Entity name matches are very relevant (x5)
+		sb.WriteString(fmt.Sprintf(`
+            (SELECT 5 * COUNT(*) FROM entities e
+             JOIN files f ON e.file_id = f.id
+             WHERE f.path = wf.path AND LOWER(e.name) LIKE '%%%s%%')`, escapedKeyword))
+
+		// Content matches count but less heavily
+		sb.WriteString(fmt.Sprintf(`
+            + (LENGTH(LOWER(wf.content)) - LENGTH(REPLACE(LOWER(wf.content), '%s', ''))) / LENGTH('%s')`, escapedKeyword, escapedKeyword))
 	}
 
-	rows, err := db.conn.Query(fmt.Sprintf(`
-        SELECT path, language, content FROM whole_files
-        %s
+	// Complete the query
+	sb.WriteString(`
+            ) AS score
+        FROM whole_files wf
+        WHERE score > 0
+        ORDER BY score DESC
         LIMIT ?
-    `, whereClause.String()), limit)
+    )
+    SELECT path, language, content FROM relevance
+    `)
+
+	// Execute the query
+	rows, err := db.conn.Query(sb.String(), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -327,4 +358,170 @@ func (db *DB) FindRelevantFiles(query string, limit int) ([]map[string]interface
 	}
 
 	return files, nil
+}
+
+func (db *DB) FindRelatedEntities(filePath string) ([]parsers.Entity, error) {
+	// Get file ID
+	var fileID int
+	err := db.conn.QueryRow("SELECT id FROM files WHERE path = ?", filePath).Scan(&fileID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Find entities in the same file
+	rows, err := db.conn.Query(`
+        SELECT e.type, e.name, e.signature, e.line_start, e.line_end, e.content, e.description
+        FROM entities e
+        WHERE e.file_id = ?
+        ORDER BY e.line_start
+        LIMIT 5`, fileID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entities []parsers.Entity
+	for rows.Next() {
+		var e parsers.Entity
+		if err := rows.Scan(&e.Type, &e.Name, &e.Signature, &e.LineStart, &e.LineEnd, &e.Content, &e.Description); err != nil {
+			return nil, err
+		}
+		entities = append(entities, e)
+	}
+
+	return entities, nil
+}
+
+// ChunkedCodeSection represents a section of code with relevance information
+type ChunkedCodeSection struct {
+	Path      string
+	Language  string
+	Content   string
+	StartLine int
+	EndLine   int
+	Score     int
+}
+
+// FindRelevantCodeSections finds relevant sections of code rather than whole files
+func (db *DB) FindRelevantCodeSections(query string, limit int) ([]ChunkedCodeSection, error) {
+	keywords := strings.Fields(strings.ToLower(query))
+
+	// Build query conditions with the correct number of placeholders
+	var conditions []string
+	var params []interface{}
+
+	for _, keyword := range keywords {
+		escapedKeyword := "%" + strings.ToLower(keyword) + "%"
+		conditions = append(conditions, "(LOWER(e.name) LIKE ? OR LOWER(e.content) LIKE ?)")
+		params = append(params, escapedKeyword, escapedKeyword)
+	}
+
+	// If no keywords, use a default condition that matches everything
+	if len(conditions) == 0 {
+		conditions = append(conditions, "1=1")
+	}
+
+	// Build the query
+	query = `
+        SELECT
+            e.id, e.name, e.type, e.line_start, e.line_end,
+            f.path, f.language,
+            (SELECT content FROM whole_files WHERE path = f.path) as file_content
+        FROM entities e
+        JOIN files f ON e.file_id = f.id
+        WHERE ` + strings.Join(conditions, " OR ") + `
+        ORDER BY e.id DESC
+        LIMIT ?`
+
+	// Add the limit parameter
+	params = append(params, limit*3) // Get more entities than needed for filtering
+
+	// Execute the query with the correct number of parameters
+	rows, err := db.conn.Query(query, params...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	// Process entities into code sections
+	var sections []ChunkedCodeSection
+	processedFiles := make(map[string]bool)
+
+	for rows.Next() {
+		var id int
+		var name, entityType string
+		var lineStart, lineEnd int
+		var path, language, fileContent string
+
+		err := rows.Scan(&id, &name, &entityType, &lineStart, &lineEnd, &path, &language, &fileContent)
+		if err != nil {
+			return nil, err
+		}
+
+		// Don't process the same file twice
+		if processedFiles[path] {
+			continue
+		}
+
+		// Split the file content into lines
+		lines := strings.Split(fileContent, "\n")
+
+		// Add some context lines before and after
+		contextLines := 5
+		effectiveStart := max(0, lineStart-contextLines-1)
+		effectiveEnd := min(len(lines), lineEnd+contextLines)
+
+		// Extract the relevant section with context
+		sectionLines := lines[effectiveStart:effectiveEnd]
+		sectionContent := strings.Join(sectionLines, "\n")
+
+		// Calculate score based on keyword matches
+		score := 10 // Base score for being an entity match
+		for _, keyword := range keywords {
+			if strings.Contains(strings.ToLower(name), strings.ToLower(keyword)) {
+				score += 5 // Bonus for name match
+			}
+			if strings.Contains(strings.ToLower(sectionContent), strings.ToLower(keyword)) {
+				score += 2 // Bonus for content match
+			}
+		}
+
+		sections = append(sections, ChunkedCodeSection{
+			Path:      path,
+			Language:  language,
+			Content:   sectionContent,
+			StartLine: effectiveStart + 1,
+			EndLine:   effectiveEnd,
+			Score:     score,
+		})
+
+		processedFiles[path] = true
+
+		// Limit the number of files processed
+		if len(sections) >= limit {
+			break
+		}
+	}
+
+	// Sort sections by score
+	sort.Slice(sections, func(i, j int) bool {
+		return sections[i].Score > sections[j].Score
+	})
+
+	return sections, nil
+}
+
+// Helper functions
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a > b {
+		return b
+	}
+	return a
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -78,116 +79,136 @@ func (c *OllamaClient) GenerateResponse(query string, entities []parsers.Entity)
 }
 
 func (c *OllamaClient) GenerateStreamingResponse(query string, db *storage.DB) error {
-    // Find relevant files
-    files, err := db.FindRelevantFiles(query, 5) // Limit to 5 files
-    if err != nil {
-        return err
-    }
+	// Find relevant code sections instead of files
+	sections, err := db.FindRelevantCodeSections(query, 5)
+	if err != nil {
+		return err
+	}
 
-    // Build prompt with context from files
-    var sb strings.Builder
+	// Build prompt with context from sections
+	var sb strings.Builder
 
-    // Add system instruction
-    sb.WriteString("You are a helpful coding assistant with access to parts of the codebase. ")
-    sb.WriteString("Answer questions using the provided code context when relevant.\n\n")
+	// Add system instruction
+	sb.WriteString("You are a helpful coding assistant with access to parts of the codebase. ")
+	sb.WriteString("Answer questions using the provided code context when relevant.\n\n")
 
-    // Add code context
-    if len(files) > 0 {
-        sb.WriteString("Here are relevant parts of the codebase:\n\n")
+	// Add code context
+	if len(sections) > 0 {
+		sb.WriteString("Here are relevant parts of the codebase:\n\n")
 
-        for i, file := range files {
-            path := file["path"].(string)
-            language := file["language"].(string)
-            content := file["content"].(string)
+		for i, section := range sections {
+			sb.WriteString(fmt.Sprintf("--- File: %s (Lines %d-%d) ---\n",
+				section.Path, section.StartLine, section.EndLine))
 
-            sb.WriteString(fmt.Sprintf("--- File: %s ---\n", path))
+			sb.WriteString(fmt.Sprintf("```%s\n%s\n```\n\n", section.Language, section.Content))
 
-            // Truncate content if it's too large
-            if len(content) > 2000 {
-                content = content[:2000] + "\n...(truncated for brevity)"
-            }
+			// Limit context size
+			if i >= 4 {
+				sb.WriteString("...(additional code sections omitted for brevity)...\n\n")
+				break
+			}
+		}
 
-            sb.WriteString(fmt.Sprintf("```%s\n%s\n```\n\n", language, content))
+		// Add relationship information if available
+		sb.WriteString("Relevant code relationships:\n")
+		for i, section := range sections {
+			if i >= 3 { // Limit to top 3 for brevity
+				break
+			}
 
-            // Limit context size
-            if i >= 4 {
-                sb.WriteString("...(additional files omitted for brevity)...\n\n")
-                break
-            }
-        }
-    } else {
-        sb.WriteString("No relevant code files found. Try scanning your codebase first with:\n")
-        sb.WriteString("./bin/codeassist scan -path=/path/to/your/project -langs=go,rb,js\n\n")
-    }
+			// Extract file basename for clarity
+			basename := filepath.Base(section.Path)
 
-    // Add user query
-    sb.WriteString("User question: " + query + "\n\n")
-    sb.WriteString("Please provide a detailed and comprehensive response based on the code context above.")
+			// Add relationship info
+			if relatedEntities, err := db.FindRelatedEntities(section.Path); err == nil && len(relatedEntities) > 0 {
+				sb.WriteString(fmt.Sprintf("- %s: ", basename))
+				for j, entity := range relatedEntities {
+					if j > 0 {
+						sb.WriteString(", ")
+					}
+					sb.WriteString(fmt.Sprintf("%s (%s)", entity.Name, entity.Type))
+					if j >= 2 {
+						sb.WriteString("...")
+						break
+					}
+				}
+				sb.WriteString("\n")
+			}
+		}
+		sb.WriteString("\n")
+	} else {
+		sb.WriteString("No relevant code sections found. Try scanning your codebase first with:\n")
+		sb.WriteString("./bin/codeassist scan -path=/path/to/your/project -langs=go,rb,js\n\n")
+	}
 
-    prompt := sb.String()
+	// Add user query
+	sb.WriteString("User question: " + query + "\n\n")
+	sb.WriteString("Please provide a detailed and comprehensive response based on the code context above.")
 
-    // Create request body
-    reqBody, err := json.Marshal(map[string]interface{}{
-        "model":  c.model,
-        "prompt": prompt,
-        "stream": true,
-    })
-    if err != nil {
-        return err
-    }
+	prompt := sb.String()
 
-    fmt.Printf("Using Ollama model: %s\n", c.model)
-    fmt.Println("Found", len(files), "relevant files")
-    fmt.Println("Sending streaming request to Ollama...")
-    fmt.Println("\nResponse:")
+	// Create request body
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model":  c.model,
+		"prompt": prompt,
+		"stream": true,
+	})
+	if err != nil {
+		return err
+	}
 
-    // Make API request
-    client := &http.Client{
-        Timeout: 10 * time.Minute,
-    }
+	fmt.Printf("Using Ollama model: %s\n", c.model)
+	fmt.Println("Found", len(sections), "relevant code sections")
+	fmt.Println("Sending streaming request to Ollama...")
+	fmt.Println("\nResponse:")
 
-    resp, err := client.Post(fmt.Sprintf("%s/api/generate", c.baseURL),
-        "application/json", bytes.NewBuffer(reqBody))
-    if err != nil {
-        fmt.Printf("Error connecting to Ollama: %v\n", err)
-        return err
-    }
-    defer resp.Body.Close()
+	// Make API request
+	client := &http.Client{
+		Timeout: 10 * time.Minute,
+	}
 
-    // Read the response line by line
-    scanner := bufio.NewScanner(resp.Body)
-    for scanner.Scan() {
-        line := scanner.Text()
-        if line == "" {
-            continue
-        }
+	resp, err := client.Post(fmt.Sprintf("%s/api/generate", c.baseURL),
+		"application/json", bytes.NewBuffer(reqBody))
+	if err != nil {
+		fmt.Printf("Error connecting to Ollama: %v\n", err)
+		return err
+	}
+	defer resp.Body.Close()
 
-        // Parse the JSON response
-        var streamResp map[string]interface{}
-        if err := json.Unmarshal([]byte(line), &streamResp); err != nil {
-            continue // Skip invalid JSON
-        }
+	// Read the response line by line
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
 
-        // Extract and print token
-        if token, ok := streamResp["response"].(string); ok {
-            fmt.Print(token)
-            // Flush stdout to ensure immediate display
-            os.Stdout.Sync()
-        }
+		// Parse the JSON response
+		var streamResp map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &streamResp); err != nil {
+			continue // Skip invalid JSON
+		}
 
-        // Check if we're done
-        if done, ok := streamResp["done"].(bool); ok && done {
-            fmt.Println() // Add newline at the end
-            break
-        }
-    }
+		// Extract and print token
+		if token, ok := streamResp["response"].(string); ok {
+			fmt.Print(token)
+			// Flush stdout to ensure immediate display
+			os.Stdout.Sync()
+		}
 
-    if err := scanner.Err(); err != nil {
-        fmt.Printf("\nError reading response: %v\n", err)
-        return err
-    }
+		// Check if we're done
+		if done, ok := streamResp["done"].(bool); ok && done {
+			fmt.Println() // Add newline at the end
+			break
+		}
+	}
 
-    return nil
+	if err := scanner.Err(); err != nil {
+		fmt.Printf("\nError reading response: %v\n", err)
+		return err
+	}
+
+	return nil
 }
 
 // ListModels lists available models from Ollama
