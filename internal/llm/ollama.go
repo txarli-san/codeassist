@@ -1,14 +1,17 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/txarli-san/codeassist/internal/scanner/parsers"
+	"github.com/txarli-san/codeassist/internal/storage"
 )
 
 // OllamaClient handles interaction with Ollama API
@@ -72,6 +75,119 @@ func (c *OllamaClient) GenerateResponse(query string, entities []parsers.Entity)
 	}
 
 	return response, nil
+}
+
+func (c *OllamaClient) GenerateStreamingResponse(query string, db *storage.DB) error {
+    // Find relevant files
+    files, err := db.FindRelevantFiles(query, 5) // Limit to 5 files
+    if err != nil {
+        return err
+    }
+
+    // Build prompt with context from files
+    var sb strings.Builder
+
+    // Add system instruction
+    sb.WriteString("You are a helpful coding assistant with access to parts of the codebase. ")
+    sb.WriteString("Answer questions using the provided code context when relevant.\n\n")
+
+    // Add code context
+    if len(files) > 0 {
+        sb.WriteString("Here are relevant parts of the codebase:\n\n")
+
+        for i, file := range files {
+            path := file["path"].(string)
+            language := file["language"].(string)
+            content := file["content"].(string)
+
+            sb.WriteString(fmt.Sprintf("--- File: %s ---\n", path))
+
+            // Truncate content if it's too large
+            if len(content) > 2000 {
+                content = content[:2000] + "\n...(truncated for brevity)"
+            }
+
+            sb.WriteString(fmt.Sprintf("```%s\n%s\n```\n\n", language, content))
+
+            // Limit context size
+            if i >= 4 {
+                sb.WriteString("...(additional files omitted for brevity)...\n\n")
+                break
+            }
+        }
+    } else {
+        sb.WriteString("No relevant code files found. Try scanning your codebase first with:\n")
+        sb.WriteString("./bin/codeassist scan -path=/path/to/your/project -langs=go,rb,js\n\n")
+    }
+
+    // Add user query
+    sb.WriteString("User question: " + query + "\n\n")
+    sb.WriteString("Please provide a detailed and comprehensive response based on the code context above.")
+
+    prompt := sb.String()
+
+    // Create request body
+    reqBody, err := json.Marshal(map[string]interface{}{
+        "model":  c.model,
+        "prompt": prompt,
+        "stream": true,
+    })
+    if err != nil {
+        return err
+    }
+
+    fmt.Printf("Using Ollama model: %s\n", c.model)
+    fmt.Println("Found", len(files), "relevant files")
+    fmt.Println("Sending streaming request to Ollama...")
+    fmt.Println("\nResponse:")
+
+    // Make API request
+    client := &http.Client{
+        Timeout: 10 * time.Minute,
+    }
+
+    resp, err := client.Post(fmt.Sprintf("%s/api/generate", c.baseURL),
+        "application/json", bytes.NewBuffer(reqBody))
+    if err != nil {
+        fmt.Printf("Error connecting to Ollama: %v\n", err)
+        return err
+    }
+    defer resp.Body.Close()
+
+    // Read the response line by line
+    scanner := bufio.NewScanner(resp.Body)
+    for scanner.Scan() {
+        line := scanner.Text()
+        if line == "" {
+            continue
+        }
+
+        // Parse the JSON response
+        var streamResp map[string]interface{}
+        if err := json.Unmarshal([]byte(line), &streamResp); err != nil {
+            continue // Skip invalid JSON
+        }
+
+        // Extract and print token
+        if token, ok := streamResp["response"].(string); ok {
+            fmt.Print(token)
+            // Flush stdout to ensure immediate display
+            os.Stdout.Sync()
+        }
+
+        // Check if we're done
+        if done, ok := streamResp["done"].(bool); ok && done {
+            fmt.Println() // Add newline at the end
+            break
+        }
+    }
+
+    if err := scanner.Err(); err != nil {
+        fmt.Printf("\nError reading response: %v\n", err)
+        return err
+    }
+
+    return nil
 }
 
 // ListModels lists available models from Ollama
