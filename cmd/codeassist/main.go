@@ -19,26 +19,23 @@ func main() {
 	ollamaURL := flag.String("ollama-url", "http://localhost:11434", "URL for Ollama API")
 	ollamaModel := flag.String("model", "codellama", "Ollama model to use")
 
-	// Define subcommands
-	scanCmd := flag.NewFlagSet("scan", flag.ExitOnError)
-	scanPath := scanCmd.String("path", ".", "Path to scan for code")
-	scanLangs := scanCmd.String("langs", "go,rb,js", "Comma-separated list of languages to scan")
-
-	queryCmd := flag.NewFlagSet("query", flag.ExitOnError)
-	queryStr := queryCmd.String("q", "", "Question about your codebase")
-
-	interactiveCmd := flag.NewFlagSet("interactive", flag.ExitOnError)
-
-	statsCmd := flag.NewFlagSet("stats", flag.ExitOnError)
-
 	// Check if command provided
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
 	}
 
-	// Parse global flags
-	flag.Parse()
+	// Find the subcommand position
+	cmdIndex := 1
+	for i := 1; i < len(os.Args); i++ {
+		if !strings.HasPrefix(os.Args[i], "-") {
+			cmdIndex = i
+			break
+		}
+	}
+
+	// Parse global flags (everything before the subcommand)
+	flag.CommandLine.Parse(os.Args[1:cmdIndex])
 
 	// Initialize database
 	db, err := storage.InitDB(*dbPath)
@@ -50,17 +47,28 @@ func main() {
 	// Initialize Ollama client
 	ollamaClient := llm.NewOllamaClient(*ollamaURL, *ollamaModel)
 
-	// Parse command
-	switch os.Args[1] {
+	// Get the subcommand
+	cmd := os.Args[cmdIndex]
+	cmdArgs := os.Args[cmdIndex+1:]
+
+	// Handle based on subcommand
+	switch cmd {
 	case "scan":
-		scanCmd.Parse(os.Args[2:])
+		scanCmd := flag.NewFlagSet("scan", flag.ExitOnError)
+		scanPath := scanCmd.String("path", ".", "Path to scan for code")
+		scanLangs := scanCmd.String("langs", "go,rb,js", "Comma-separated list of languages to scan")
+		scanCmd.Parse(cmdArgs)
+
 		fmt.Printf("Scanning directory: %s for languages: %s\n", *scanPath, *scanLangs)
 		if err := scanner.ScanDirectory(*scanPath, *scanLangs, db); err != nil {
 			log.Fatalf("Scan failed: %v", err)
 		}
 
 	case "query":
-		queryCmd.Parse(os.Args[2:])
+		queryCmd := flag.NewFlagSet("query", flag.ExitOnError)
+		queryStr := queryCmd.String("q", "", "Question to ask")
+		queryCmd.Parse(cmdArgs)
+
 		if *queryStr == "" {
 			fmt.Println("Please provide a query with -q")
 			os.Exit(1)
@@ -72,11 +80,9 @@ func main() {
 		}
 
 	case "interactive":
-		interactiveCmd.Parse(os.Args[2:])
 		runInteractiveMode(db, ollamaClient)
 
 	case "stats":
-		statsCmd.Parse(os.Args[2:])
 		showStats(db)
 
 	default:
@@ -107,48 +113,27 @@ func processQuery(query string, db *storage.DB, client *llm.OllamaClient) error 
 
 	// Try to use the streaming response with whole files
 	files, err := db.FindRelevantFiles(query, 5)
-	if err != nil {
-		fmt.Printf("Error finding relevant files: %v\n", err)
-		// Fall back to the entity-based approach if needed
-		entities, err := db.FindRelevantEntities(query)
-		if err != nil {
-			return fmt.Errorf("failed to find relevant code: %v", err)
-		}
-
-		fmt.Printf("Found %d relevant code entities. Using entity-based response...\n", len(entities))
-
-		response, err := client.GenerateResponse(query, entities)
-		if err != nil {
-			return err
-		}
-
-		fmt.Println("\nResponse:")
-		fmt.Println(response)
-		return nil
-	}
-
-	// If we found files, use the file-based streaming response
-	if len(files) > 0 {
+	if err == nil && len(files) > 0 {
 		fmt.Printf("Found %d relevant files. Using file-based streaming response...\n", len(files))
 		return client.GenerateStreamingResponse(query, db)
-	} else {
-		// Fall back to the entity-based approach
-		entities, err := db.FindRelevantEntities(query)
-		if err != nil {
-			return fmt.Errorf("failed to find relevant code: %v", err)
-		}
-
-		fmt.Printf("Found %d relevant code entities. Using entity-based response...\n", len(entities))
-
-		response, err := client.GenerateResponse(query, entities)
-		if err != nil {
-			return err
-		}
-
-		fmt.Println("\nResponse:")
-		fmt.Println(response)
-		return nil
 	}
+
+	// Fall back to the entity-based approach if no files found or error occurred
+	entities, err := db.FindRelevantEntities(query)
+	if err != nil {
+		return fmt.Errorf("failed to find relevant code: %v", err)
+	}
+
+	fmt.Printf("Found %d relevant code entities. Using entity-based response...\n", len(entities))
+
+	response, err := client.GenerateResponse(query, entities)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("\nResponse:")
+	fmt.Println(response)
+	return nil
 }
 
 func runInteractiveMode(db *storage.DB, client *llm.OllamaClient) {
@@ -170,7 +155,6 @@ func runInteractiveMode(db *storage.DB, client *llm.OllamaClient) {
 			continue
 		}
 
-		// Use the processQuery function which now uses GenerateStreamingResponse
 		err := processQuery(query, db, client)
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
