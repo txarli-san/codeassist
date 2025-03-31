@@ -24,32 +24,42 @@ func InitDB(dbFile string) (*DB, error) {
 
 	// Create basic tables
 	_, err = conn.Exec(`
-CREATE TABLE IF NOT EXISTS files (
-    id INTEGER PRIMARY KEY,
-    path TEXT NOT NULL UNIQUE,
-    language TEXT NOT NULL,
-    last_modified INTEGER NOT NULL,
-    size INTEGER NOT NULL
-);
+	CREATE TABLE IF NOT EXISTS files (
+	    id INTEGER PRIMARY KEY,
+	    path TEXT NOT NULL UNIQUE,
+	    language TEXT NOT NULL,
+	    last_modified INTEGER NOT NULL,
+	    size INTEGER NOT NULL
+	);
 
-CREATE TABLE IF NOT EXISTS entities (
-    id INTEGER PRIMARY KEY,
-    file_id INTEGER NOT NULL,
-    type TEXT NOT NULL,
-    name TEXT NOT NULL,
-    signature TEXT,
-    line_start INTEGER NOT NULL,
-    line_end INTEGER NOT NULL,
-    content TEXT NOT NULL,
-    description TEXT,
-    FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
-);
+	CREATE TABLE IF NOT EXISTS entities (
+	    id INTEGER PRIMARY KEY,
+	    file_id INTEGER NOT NULL,
+	    type TEXT NOT NULL,
+	    name TEXT NOT NULL,
+	    signature TEXT,
+	    line_start INTEGER NOT NULL,
+	    line_end INTEGER NOT NULL,
+	    content TEXT NOT NULL,
+	    description TEXT,
+	    FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+	);
 
-CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
-CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
-CREATE INDEX IF NOT EXISTS idx_entities_file_id ON entities(file_id);
-CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type);
-`)
+	CREATE TABLE IF NOT EXISTS whole_files (
+	    id INTEGER PRIMARY KEY,
+	    path TEXT NOT NULL UNIQUE,
+	    language TEXT NOT NULL,
+	    last_modified INTEGER NOT NULL,
+	    content TEXT NOT NULL
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
+	CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
+	CREATE INDEX IF NOT EXISTS idx_entities_file_id ON entities(file_id);
+	CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type);
+	CREATE INDEX IF NOT EXISTS idx_whole_files_path ON whole_files(path);
+	CREATE INDEX IF NOT EXISTS idx_whole_files_language ON whole_files(language);
+	`)
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -267,4 +277,54 @@ func (db *DB) GetStats() (map[string]int, error) {
 	}
 
 	return stats, nil
+}
+
+func (db *DB) StoreWholeFile(path, language string, modTime int64, content string) error {
+	_, err := db.conn.Exec(
+		"INSERT OR REPLACE INTO whole_files (path, language, last_modified, content) VALUES (?, ?, ?, ?)",
+		path, language, modTime, content,
+	)
+	return err
+}
+
+func (db *DB) FindRelevantFiles(query string, limit int) ([]map[string]interface{}, error) {
+	keywords := strings.Fields(strings.ToLower(query))
+
+	var whereClause strings.Builder
+	whereClause.WriteString("WHERE ")
+
+	for i, keyword := range keywords {
+		if i > 0 {
+			whereClause.WriteString(" OR ")
+		}
+		whereClause.WriteString(fmt.Sprintf("(LOWER(path) LIKE '%%%s%%' OR LOWER(content) LIKE '%%%s%%')",
+			keyword, keyword))
+	}
+
+	rows, err := db.conn.Query(fmt.Sprintf(`
+        SELECT path, language, content FROM whole_files
+        %s
+        LIMIT ?
+    `, whereClause.String()), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var files []map[string]interface{}
+
+	for rows.Next() {
+		var path, language, content string
+		if err := rows.Scan(&path, &language, &content); err != nil {
+			return nil, err
+		}
+
+		files = append(files, map[string]interface{}{
+			"path":     path,
+			"language": language,
+			"content":  content,
+		})
+	}
+
+	return files, nil
 }

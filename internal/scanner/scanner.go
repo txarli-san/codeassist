@@ -65,7 +65,7 @@ func ScanDirectory(rootDir, languages string, db *storage.DB) error {
 			return nil
 		}
 
-		// Read file
+		// Read file content
 		content, err := os.ReadFile(path)
 		if err != nil {
 			fmt.Printf("Warning: Could not read file %s: %v\n", path, err)
@@ -73,8 +73,15 @@ func ScanDirectory(rootDir, languages string, db *storage.DB) error {
 			return nil
 		}
 
-		fmt.Printf("Parsing file: %s\n", path)
+		fmt.Printf("Scanning file: %s\n", path)
 		stats.filesScanned++
+
+		// Store the whole file
+		if err := db.StoreWholeFile(path, ext, info.ModTime().Unix(), string(content)); err != nil {
+			fmt.Printf("Warning: Could not store whole file %s: %v\n", path, err)
+			stats.errors++
+			// Continue anyway - don't return
+		}
 
 		// Parse file based on language
 		var parser parsers.Parser
@@ -86,7 +93,7 @@ func ScanDirectory(rootDir, languages string, db *storage.DB) error {
 		case "js":
 			parser = &parsers.JavaScriptParser{}
 		default:
-			// Skip unsupported file types
+			// Skip unsupported file types for detailed parsing
 			return nil
 		}
 
@@ -102,9 +109,9 @@ func ScanDirectory(rootDir, languages string, db *storage.DB) error {
 
 		// Store file and entities in database
 		if err := db.StoreFileAndEntities(path, ext, info.ModTime().Unix(), len(content), entities); err != nil {
-			fmt.Printf("Warning: Could not store data for %s: %v\n", path, err)
+			fmt.Printf("Warning: Could not store entities for %s: %v\n", path, err)
 			stats.errors++
-			return nil
+			// Continue anyway - don't return
 		}
 
 		return nil
@@ -112,7 +119,6 @@ func ScanDirectory(rootDir, languages string, db *storage.DB) error {
 
 	fmt.Printf("\nScan complete!\n")
 	fmt.Printf("Files scanned: %d\n", stats.filesScanned)
-	fmt.Printf("Entities found: %d\n", stats.entitiesFound)
 	fmt.Printf("Errors encountered: %d\n", stats.errors)
 
 	return err
