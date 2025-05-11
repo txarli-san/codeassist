@@ -1,17 +1,43 @@
 package parsers
 
-// Entity represents a code structure like function, class, etc.
 type Entity struct {
-	Type        string // function, method, class, struct, etc.
-	Name        string // name of the entity
-	Signature   string // parameters or type information
-	LineStart   int    // starting line in file
-	LineEnd     int    // ending line in file
-	Content     string // full content of the entity
-	Description string // documentation or comments
+	Type        string
+	Name        string
+	Signature   string
+	LineStart   int
+	LineEnd     int
+	Content     string
+	Description string
 }
 
-// Parser interface for language-specific parsers
+type CallRelation struct {
+	TargetName           string
+	TargetContext        string
+	TargetResolvedID     *int64
+	LineNumber           int
+	Arguments            []string
+	IsCrossFileOrPackage bool
+}
+
+type ImportInfo struct {
+	Path  string `json:"path"`
+	Alias string `json:"alias,omitempty"`
+}
+
+type RichEntity struct {
+	Entity
+	FilePath       string         `json:"-"`
+	PackageName    string         `json:"packageName,omitempty"`
+	SignatureJSON  string         `json:"signatureJson,omitempty"`
+	ASTMetadata    string         `json:"astMetadata,omitempty"`
+	Calls          []CallRelation `json:"calls,omitempty"`
+	Imports        []ImportInfo   `json:"imports,omitempty"`
+	LocalVariables []string       `json:"localVariables,omitempty"`
+	ReceiverType   string         `json:"receiverType,omitempty"`
+	ParamCount     int            `json:"paramCount,omitempty"`
+	ReturnCount    int            `json:"returnCount,omitempty"`
+}
+
 type Parser interface {
-	Parse(content string) ([]Entity, error)
+	Parse(filePath string, content string) ([]RichEntity, error)
 }

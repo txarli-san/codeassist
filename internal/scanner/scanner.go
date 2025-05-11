@@ -10,26 +10,40 @@ import (
 	"github.com/txarli-san/codeassist/internal/storage"
 )
 
-// ScanDirectory recursively scans a directory for code files
 func ScanDirectory(rootDir, languages string, db *storage.DB) error {
-	// Parse languages list
-	langs := strings.Split(languages, ",")
+	supportedLanguages := map[string]bool{
+		"go":   true,
+		"rb":   true,
+		"js":   true,
+		"html": true,
+	}
+
 	langMap := make(map[string]bool)
-	for _, l := range langs {
-		langMap[strings.TrimSpace(l)] = true
+	if languages != "" && languages != "*" {
+		langs := strings.Split(languages, ",")
+		for _, l := range langs {
+			lang := strings.TrimSpace(l)
+			if supportedLanguages[lang] {
+				langMap[lang] = true
+			}
+		}
+	} else {
+		langMap = supportedLanguages
 	}
 
 	fmt.Printf("Starting scan of directory: %s\n", rootDir)
-	fmt.Printf("Languages to scan: %s\n", languages)
+	if languages == "" || languages == "*" {
+		fmt.Println("Scanning for all supported languages")
+	} else {
+		fmt.Printf("Languages to scan: %s\n", languages)
+	}
 
-	// Count statistics
 	var stats struct {
 		filesScanned  int
 		entitiesFound int
 		errors        int
 	}
 
-	// Walk directory
 	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			fmt.Printf("Error accessing path %s: %v\n", path, err)
@@ -37,7 +51,6 @@ func ScanDirectory(rootDir, languages string, db *storage.DB) error {
 			return filepath.SkipDir
 		}
 
-		// Skip directories we don't want to scan
 		if info.IsDir() {
 			basename := filepath.Base(path)
 			if basename == ".git" || basename == "node_modules" || basename == "vendor" || basename == ".bundle" {
@@ -47,43 +60,45 @@ func ScanDirectory(rootDir, languages string, db *storage.DB) error {
 			return nil
 		}
 
-		// Get file extension
 		ext := strings.TrimPrefix(filepath.Ext(path), ".")
+		originalExt := ext
 
-		// Map some extensions to their language
-		switch ext {
-		case "jsx", "ts", "tsx":
-			ext = "js" // Treat as JavaScript
-		case "rake", "gemspec":
-			ext = "rb" // Treat as Ruby
-		case "go":
-			ext = "go" // Already correct, just for clarity
+		if strings.HasSuffix(path, ".html.erb") {
+			ext = "html"
+		} else if strings.HasSuffix(path, ".jsx") || strings.HasSuffix(path, ".tsx") {
+			ext = "js"
+		} else if strings.HasSuffix(path, ".rake") || strings.HasSuffix(path, ".gemspec") {
+			ext = "rb"
 		}
 
-		// Check if file should be scanned based on extension
 		if !langMap[ext] {
-			return nil
+			if originalExt == "htm" && langMap["html"] {
+				ext = "html"
+			} else if (originalExt == "jsx" || originalExt == "tsx") && langMap["js"] {
+				ext = "js"
+			} else if (originalExt == "rake" || originalExt == "gemspec") && langMap["rb"] {
+				ext = "rb"
+			} else {
+				return nil
+			}
 		}
 
-		// Read file content
-		content, err := os.ReadFile(path)
+		contentBytes, err := os.ReadFile(path)
 		if err != nil {
 			fmt.Printf("Warning: Could not read file %s: %v\n", path, err)
 			stats.errors++
 			return nil
 		}
+		contentStr := string(contentBytes)
 
-		fmt.Printf("Scanning file: %s\n", path)
+		fmt.Printf("Scanning file: %s (lang: %s)\n", path, ext)
 		stats.filesScanned++
 
-		// Store the whole file
-		if err := db.StoreWholeFile(path, ext, info.ModTime().Unix(), string(content)); err != nil {
+		if err := db.StoreWholeFile(path, ext, info.ModTime().Unix(), contentStr); err != nil {
 			fmt.Printf("Warning: Could not store whole file %s: %v\n", path, err)
 			stats.errors++
-			// Continue anyway - don't return
 		}
 
-		// Parse file based on language
 		var parser parsers.Parser
 		switch ext {
 		case "go":
@@ -92,26 +107,29 @@ func ScanDirectory(rootDir, languages string, db *storage.DB) error {
 			parser = &parsers.RubyParser{}
 		case "js":
 			parser = &parsers.JavaScriptParser{}
+		case "html":
+			parser = &parsers.HTMLParser{}
 		default:
-			// Skip unsupported file types for detailed parsing
 			return nil
 		}
 
-		// Parse and store entities
-		entities, err := parser.Parse(string(content))
+		richEntities, err := parser.Parse(path, contentStr)
 		if err != nil {
 			fmt.Printf("Warning: Could not parse %s: %v\n", path, err)
 			stats.errors++
 			return nil
 		}
 
-		stats.entitiesFound += len(entities)
+		stats.entitiesFound += len(richEntities)
 
-		// Store file and entities in database
-		if err := db.StoreFileAndEntities(path, ext, info.ModTime().Unix(), len(content), entities); err != nil {
+		var plainEntities []parsers.Entity
+		for _, re := range richEntities {
+			plainEntities = append(plainEntities, re.Entity)
+		}
+
+		if err := db.StoreFileAndEntities(path, ext, info.ModTime().Unix(), len(contentBytes), plainEntities); err != nil {
 			fmt.Printf("Warning: Could not store entities for %s: %v\n", path, err)
 			stats.errors++
-			// Continue anyway - don't return
 		}
 
 		return nil
@@ -119,6 +137,7 @@ func ScanDirectory(rootDir, languages string, db *storage.DB) error {
 
 	fmt.Printf("\nScan complete!\n")
 	fmt.Printf("Files scanned: %d\n", stats.filesScanned)
+	fmt.Printf("Entities found: %d\n", stats.entitiesFound)
 	fmt.Printf("Errors encountered: %d\n", stats.errors)
 
 	return err
