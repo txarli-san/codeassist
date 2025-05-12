@@ -2,7 +2,9 @@ package storage
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 
@@ -10,23 +12,25 @@ import (
 	"github.com/txarli-san/codeassist/internal/scanner/parsers"
 )
 
-// DB wraps the database connection
 type DB struct {
 	conn   *sql.DB
-	hasFTS bool // Flag to indicate if FTS is available
+	hasFTS bool
 }
 
-// InitDB initializes the database
 func InitDB(dbFile string) (*DB, error) {
-	conn, err := sql.Open("sqlite3", dbFile)
+	conn, err := sql.Open("sqlite3", dbFile+"?_foreign_keys=on")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	// Create basic tables
-	_, err = conn.Exec(`
+	_, err = conn.Exec("PRAGMA journal_mode=WAL;")
+	if err != nil {
+		fmt.Printf("Warning: Failed to enable WAL mode: %v\n", err)
+	}
+
+	schemaSQL := `
 	CREATE TABLE IF NOT EXISTS files (
-	    id INTEGER PRIMARY KEY,
+	    id INTEGER PRIMARY KEY AUTOINCREMENT,
 	    path TEXT NOT NULL UNIQUE,
 	    language TEXT NOT NULL,
 	    last_modified INTEGER NOT NULL,
@@ -34,7 +38,7 @@ func InitDB(dbFile string) (*DB, error) {
 	);
 
 	CREATE TABLE IF NOT EXISTS entities (
-	    id INTEGER PRIMARY KEY,
+	    id INTEGER PRIMARY KEY AUTOINCREMENT,
 	    file_id INTEGER NOT NULL,
 	    type TEXT NOT NULL,
 	    name TEXT NOT NULL,
@@ -43,238 +47,566 @@ func InitDB(dbFile string) (*DB, error) {
 	    line_end INTEGER NOT NULL,
 	    content TEXT NOT NULL,
 	    description TEXT,
+	    package_context TEXT,
+	    signature_json TEXT,
+	    ast_metadata_json TEXT,
+	    receiver_type TEXT,
+	    param_count INTEGER,
+	    return_count INTEGER,
 	    FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
 	);
 
 	CREATE TABLE IF NOT EXISTS whole_files (
-	    id INTEGER PRIMARY KEY,
+	    id INTEGER PRIMARY KEY AUTOINCREMENT,
 	    path TEXT NOT NULL UNIQUE,
 	    language TEXT NOT NULL,
 	    last_modified INTEGER NOT NULL,
 	    content TEXT NOT NULL
 	);
 
+	CREATE TABLE IF NOT EXISTS file_imports (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		file_id INTEGER NOT NULL,
+		import_path TEXT NOT NULL,
+		alias TEXT,
+		FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+		UNIQUE(file_id, import_path)
+	);
+
+	CREATE TABLE IF NOT EXISTS entity_relationships (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		source_entity_id INTEGER NOT NULL,
+		target_entity_name TEXT NOT NULL,
+		target_entity_context TEXT,
+		target_entity_id INTEGER,
+		relationship_type TEXT NOT NULL,
+		line_number INTEGER,
+		details_json TEXT,
+		FOREIGN KEY (source_entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+		FOREIGN KEY (target_entity_id) REFERENCES entities(id) ON DELETE SET NULL
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
 	CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
 	CREATE INDEX IF NOT EXISTS idx_entities_file_id ON entities(file_id);
 	CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type);
+	CREATE INDEX IF NOT EXISTS idx_entities_receiver_type ON entities(receiver_type);
 	CREATE INDEX IF NOT EXISTS idx_whole_files_path ON whole_files(path);
 	CREATE INDEX IF NOT EXISTS idx_whole_files_language ON whole_files(language);
-	`)
+	CREATE INDEX IF NOT EXISTS idx_file_imports_file_id ON file_imports(file_id);
+	CREATE INDEX IF NOT EXISTS idx_entity_relationships_source ON entity_relationships(source_entity_id, relationship_type);
+	CREATE INDEX IF NOT EXISTS idx_entity_relationships_target_id ON entity_relationships(target_entity_id, relationship_type);
+	CREATE INDEX IF NOT EXISTS idx_entity_relationships_target_name ON entity_relationships(target_entity_name, relationship_type);
+	`
+	_, err = conn.Exec(schemaSQL)
 	if err != nil {
 		conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("error creating base tables: %w", err)
 	}
 
 	db := &DB{conn: conn, hasFTS: false}
 
-	// Try to create FTS virtual table - this might fail if FTS is not available
-	_, err = conn.Exec(`
-CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts4(
-    name, content, description,
-    content='entities',
-    content_rowid='id'
-);
-	`)
-
-	if err == nil {
-		// FTS is available, create triggers
-		_, err = conn.Exec(`
-CREATE TRIGGER IF NOT EXISTS entities_ai AFTER INSERT ON entities BEGIN
-  INSERT INTO entities_fts(rowid, name, content, description) VALUES (new.id, new.name, new.content, new.description);
-END;
-
-CREATE TRIGGER IF NOT EXISTS entities_ad AFTER DELETE ON entities BEGIN
-  INSERT INTO entities_fts(entities_fts, rowid, name, content, description) VALUES('delete', old.id, old.name, old.content, old.description);
-END;
-
-CREATE TRIGGER IF NOT EXISTS entities_au AFTER UPDATE ON entities BEGIN
-  INSERT INTO entities_fts(entities_fts, rowid, name, content, description) VALUES('delete', old.id, old.name, old.content, old.description);
-  INSERT INTO entities_fts(rowid, name, content, description) VALUES (new.id, new.name, new.content, new.description);
-END;
-		`)
-
-		if err == nil {
-			db.hasFTS = true
-			fmt.Println("Full-text search enabled")
-		} else {
-			fmt.Println("Failed to create FTS triggers, using basic search")
-		}
+	var ftsEnabledOption bool
+	err = conn.QueryRow("SELECT EXISTS (SELECT 1 FROM pragma_compile_options WHERE compile_options LIKE 'ENABLE_FTS5')").Scan(&ftsEnabledOption)
+	if err != nil || !ftsEnabledOption {
+		log.Println("Warning: FTS5 module not available or check failed. Full-text search will use basic LIKE queries.")
+		db.hasFTS = false
 	} else {
-		fmt.Println("Full-text search not available, using basic search")
+		err = db.setupFTS(nil)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("error setting up FTS: %w", err)
+		}
+		db.hasFTS = true
+		fmt.Println("Full-text search (FTS5) enabled for entities.")
 	}
 
 	return db, nil
 }
 
-// Close closes the database connection
+func (db *DB) setupFTS(tx *sql.Tx) error {
+	var execer interface {
+		Exec(query string, args ...interface{}) (sql.Result, error)
+	}
+	execer = db.conn
+	if tx != nil {
+		execer = tx
+	}
+
+	_, _ = execer.Exec(`DROP TRIGGER IF EXISTS entities_ai;`)
+	_, _ = execer.Exec(`DROP TRIGGER IF EXISTS entities_ad;`)
+	_, _ = execer.Exec(`DROP TRIGGER IF EXISTS entities_au;`)
+
+	_, err := execer.Exec(`DROP TABLE IF EXISTS entities_fts;`)
+	if err != nil {
+		return fmt.Errorf("failed to drop existing entities_fts table: %w", err)
+	}
+
+	_, err = execer.Exec(`
+	CREATE VIRTUAL TABLE entities_fts USING fts5(
+		name,
+		content,
+		description,
+		package_context,
+		receiver_type,
+		content='entities',
+		content_rowid='id',
+		tokenize = "porter unicode61"
+	);`)
+	if err != nil {
+		return fmt.Errorf("failed to create entities_fts table: %w", err)
+	}
+
+	_, err = execer.Exec(`
+	CREATE TRIGGER entities_ai AFTER INSERT ON entities BEGIN
+	  INSERT INTO entities_fts(rowid, name, content, description, package_context, receiver_type) VALUES (
+		new.id,
+		new.name,
+		new.content,
+		new.description,
+		new.package_context,
+		new.receiver_type
+	  );
+	END;`)
+	if err != nil {
+		return fmt.Errorf("failed to create entities_ai trigger: %w", err)
+	}
+
+	_, err = execer.Exec(`
+	CREATE TRIGGER entities_ad AFTER DELETE ON entities BEGIN
+	  INSERT INTO entities_fts(entities_fts, rowid, name, content, description, package_context, receiver_type) VALUES(
+		'delete',
+		old.id,
+		old.name,
+		old.content,
+		old.description,
+		old.package_context,
+		old.receiver_type
+	  );
+	END;`)
+	if err != nil {
+		return fmt.Errorf("failed to create entities_ad trigger: %w", err)
+	}
+
+	_, err = execer.Exec(`
+	CREATE TRIGGER entities_au AFTER UPDATE ON entities BEGIN
+	  UPDATE entities_fts SET
+	    name = new.name,
+	    content = new.content,
+	    description = new.description,
+	    package_context = new.package_context,
+	    receiver_type = new.receiver_type
+	  WHERE rowid = old.id;
+	END;`)
+	if err != nil {
+		return fmt.Errorf("failed to create entities_au trigger: %w", err)
+	}
+
+	if tx == nil {
+		_, err = db.conn.Exec(`INSERT INTO entities_fts (rowid, name, content, description, package_context, receiver_type)
+			SELECT id, name, content, description, package_context, receiver_type FROM entities;`)
+		if err != nil {
+
+			queryErr := db.conn.QueryRow("SELECT COUNT(*) FROM entities").Scan(&[]int{}[0])
+			if queryErr != sql.ErrNoRows && queryErr != nil && !strings.Contains(queryErr.Error(), "no such table") && !strings.Contains(queryErr.Error(), "malformed database schema") {
+				log.Printf("Warning: Initial population of FTS table failed: %v", err)
+			}
+		}
+	}
+	return nil
+}
+
 func (db *DB) Close() error {
 	return db.conn.Close()
 }
 
-// StoreFileAndEntities stores a file and its entities in the database
-func (db *DB) StoreFileAndEntities(path, language string, modTime int64, size int, entities []parsers.Entity) error {
-	// Begin transaction
+func (db *DB) StoreFileAndEntities(path, language string, modTime int64, size int, richEntities []parsers.RichEntity) (err error) {
 	tx, err := db.conn.Begin()
 	if err != nil {
-		return err
+		return fmt.Errorf("begin transaction: %w", err)
 	}
+
+	committed := false
 	defer func() {
-		if err != nil {
-			tx.Rollback()
+		if !committed && err != nil {
+			rbErr := tx.Rollback()
+			if rbErr != nil {
+				log.Printf("Error rolling back transaction for path %s: %v (original error: %v)", path, rbErr, err)
+			}
+		} else if !committed && err == nil {
+
+			rbErr := tx.Rollback()
+			if rbErr != nil {
+				log.Printf("Error rolling back transaction for path %s due to no commit: %v", path, rbErr)
+			}
 		}
 	}()
 
-	// Store file
 	var fileID int64
-	stmt, err := tx.Prepare("INSERT OR REPLACE INTO files (path, language, last_modified, size) VALUES (?, ?, ?, ?)")
-	if err != nil {
-		return err
-	}
-	res, err := stmt.Exec(path, language, modTime, size)
-	if err != nil {
-		return err
-	}
-	fileID, err = res.LastInsertId()
-	if err != nil {
-		return err
-	}
-
-	// Delete existing entities for this file
-	_, err = tx.Exec("DELETE FROM entities WHERE file_id = ?", fileID)
-	if err != nil {
-		return err
-	}
-
-	// Store entities
-	stmt, err = tx.Prepare("INSERT INTO entities (file_id, type, name, signature, line_start, line_end, content, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-	if err != nil {
-		return err
-	}
-	for _, entity := range entities {
-		_, err = stmt.Exec(fileID, entity.Type, entity.Name, entity.Signature, entity.LineStart, entity.LineEnd, entity.Content, entity.Description)
+	err = tx.QueryRow("SELECT id FROM files WHERE path = ?", path).Scan(&fileID)
+	if err == sql.ErrNoRows {
+		res, errExec := tx.Exec("INSERT INTO files (path, language, last_modified, size) VALUES (?, ?, ?, ?)",
+			path, language, modTime, size)
+		if errExec != nil {
+			err = fmt.Errorf("insert file '%s': %w", path, errExec)
+			return err
+		}
+		fileID, err = res.LastInsertId()
 		if err != nil {
+
+			errQuery := tx.QueryRow("SELECT id FROM files WHERE path = ?", path).Scan(&fileID)
+			if errQuery != nil {
+				err = fmt.Errorf("get last insert id or query existing for file '%s': %w (original LastInsertId error: %v)", path, errQuery, err)
+				return err
+			}
+		}
+	} else if err != nil {
+		err = fmt.Errorf("query file id for path '%s': %w", path, err)
+		return err
+	} else {
+		_, err = tx.Exec("UPDATE files SET last_modified = ?, size = ? WHERE id = ?", modTime, size, fileID)
+		if err != nil {
+			err = fmt.Errorf("update file id %d: %w", fileID, err)
 			return err
 		}
 	}
 
-	// Commit transaction
-	return tx.Commit()
+	_, err = tx.Exec("DELETE FROM entities WHERE file_id = ?", fileID)
+	if err != nil {
+		err = fmt.Errorf("delete old entities for file_id %d: %w", fileID, err)
+		return err
+	}
+	_, err = tx.Exec("DELETE FROM file_imports WHERE file_id = ?", fileID)
+	if err != nil {
+		err = fmt.Errorf("delete old file imports for file_id %d: %w", fileID, err)
+		return err
+	}
+
+	importStmt, err := tx.Prepare("INSERT OR IGNORE INTO file_imports (file_id, import_path, alias) VALUES (?, ?, ?)")
+	if err != nil {
+		err = fmt.Errorf("prepare file_import insert: %w", err)
+		return err
+	}
+	defer importStmt.Close()
+
+	processedFileImports := make(map[string]bool)
+	if len(richEntities) > 0 && len(richEntities[0].Imports) > 0 {
+		for _, importInfo := range richEntities[0].Imports {
+			importKey := importInfo.Path + "###" + importInfo.Alias
+			if !processedFileImports[importKey] {
+				_, errExec := importStmt.Exec(fileID, importInfo.Path, importInfo.Alias)
+				if errExec != nil {
+					err = fmt.Errorf("insert file_import for file_id %d (%s): %w", fileID, importInfo.Path, errExec)
+					return err
+				}
+				processedFileImports[importKey] = true
+			}
+		}
+	}
+
+	entityStmt, err := tx.Prepare(`
+		INSERT INTO entities (
+			file_id, type, name, signature, line_start, line_end, content, description,
+			package_context, signature_json, ast_metadata_json, receiver_type, param_count, return_count
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		err = fmt.Errorf("prepare entity insert: %w", err)
+		return err
+	}
+	defer entityStmt.Close()
+
+	relStmt, err := tx.Prepare(`
+		INSERT INTO entity_relationships (
+			source_entity_id, target_entity_name, target_entity_context, target_entity_id,
+			relationship_type, line_number, details_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		err = fmt.Errorf("prepare relationship insert: %w", err)
+		return err
+	}
+	defer relStmt.Close()
+
+	for i, re := range richEntities {
+		if re.Entity.Name == "" && re.Entity.Type != "html" && re.Entity.Type != "template" && re.Entity.Type != "package" {
+			continue
+		}
+
+		signatureForDB := sql.NullString{String: re.Entity.Signature, Valid: re.Entity.Signature != ""}
+		descriptionForDB := sql.NullString{String: re.Entity.Description, Valid: re.Entity.Description != ""}
+		packageContextForDB := sql.NullString{String: re.PackageName, Valid: re.PackageName != ""}
+		signatureJSONForDB := sql.NullString{String: re.SignatureJSON, Valid: re.SignatureJSON != "" && re.SignatureJSON != "{}" && re.SignatureJSON != "null"}
+		astMetadataJSONForDB := sql.NullString{String: re.ASTMetadata, Valid: re.ASTMetadata != "" && re.ASTMetadata != "{}" && re.ASTMetadata != "null"}
+		receiverTypeForDB := sql.NullString{String: re.ReceiverType, Valid: re.ReceiverType != ""}
+		paramCountForDB := sql.NullInt64{Int64: int64(re.ParamCount), Valid: true}
+		returnCountForDB := sql.NullInt64{Int64: int64(re.ReturnCount), Valid: true}
+
+		if re.Entity.LineStart == 0 {
+			re.Entity.LineStart = 1
+		}
+		if re.Entity.LineEnd == 0 {
+			re.Entity.LineEnd = 1
+		}
+		if re.Entity.LineEnd < re.Entity.LineStart {
+			re.Entity.LineEnd = re.Entity.LineStart
+		}
+
+		entityRes, errExec := entityStmt.Exec(
+			fileID, re.Entity.Type, re.Entity.Name, signatureForDB,
+			re.Entity.LineStart, re.Entity.LineEnd, re.Entity.Content, descriptionForDB,
+			packageContextForDB, signatureJSONForDB, astMetadataJSONForDB, receiverTypeForDB,
+			paramCountForDB, returnCountForDB,
+		)
+		if errExec != nil {
+			err = fmt.Errorf("insert entity '%s' #%d for file_id %d: %w", re.Entity.Name, i, fileID, errExec)
+			return err
+		}
+
+		entityID, errLII := entityRes.LastInsertId()
+		if errLII != nil || entityID == 0 {
+			errQuery := tx.QueryRow("SELECT id FROM entities WHERE file_id = ? AND type = ? AND name = ? AND line_start = ? ORDER BY id DESC LIMIT 1",
+				fileID, re.Entity.Type, re.Entity.Name, re.Entity.LineStart).Scan(&entityID)
+			if errQuery != nil {
+				err = fmt.Errorf("error getting entity ID for '%s' (file %d, type %s, line %d): %w (original LastInsertId error: %v)", re.Entity.Name, fileID, re.Entity.Type, re.Entity.LineStart, errQuery, errLII)
+				return err
+			}
+			if entityID == 0 {
+				err = fmt.Errorf("failed to obtain valid entity ID for '%s' (file %d, type %s, line %d)", re.Entity.Name, fileID, re.Entity.Type, re.Entity.LineStart)
+				return err
+			}
+		}
+
+		for _, call := range re.Calls {
+			var detailsJSON sql.NullString
+			if len(call.Arguments) > 0 {
+				detailsBytes, marshalErr := json.Marshal(call.Arguments)
+				if marshalErr == nil {
+					detailsJSON.String = string(detailsBytes)
+					detailsJSON.Valid = true
+				}
+			}
+
+			var targetEntityID sql.NullInt64
+			if call.TargetResolvedID != nil {
+				targetEntityID.Int64 = *call.TargetResolvedID
+				targetEntityID.Valid = true
+			}
+
+			_, errExecRel := relStmt.Exec(
+				entityID, call.TargetName, call.TargetContext, targetEntityID,
+				"CALLS", call.LineNumber, detailsJSON,
+			)
+			if errExecRel != nil {
+				err = fmt.Errorf("insert call relationship for entity %s (id %d): %w", re.Entity.Name, entityID, errExecRel)
+				return err
+			}
+		}
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+	committed = true
+	return nil
 }
 
-// FindRelevantEntities finds entities relevant to a query
 func (db *DB) FindRelevantEntities(query string) ([]parsers.Entity, error) {
 	var rows *sql.Rows
 	var err error
+	limit := 15
 
-	// Use FTS if available
+	finalQueryArgs := []interface{}{}
+
+	baseSelect := `
+		SELECT e.type, e.name, e.signature, e.line_start, e.line_end, e.content, e.description, f.path,
+			   e.package_context, e.receiver_type, e.signature_json, e.ast_metadata_json, e.param_count, e.return_count
+		FROM entities e
+		JOIN files f ON e.file_id = f.id`
+
+	var ftsMatchClause string
+	var orderByClause string
+
 	if db.hasFTS {
-		rows, err = db.conn.Query(`
-SELECT e.type, e.name, e.signature, e.line_start, e.line_end, e.content, e.description, f.path
-FROM entities_fts fts
-JOIN entities e ON fts.rowid = e.id
-JOIN files f ON e.file_id = f.id
-WHERE entities_fts MATCH ?
-LIMIT 10
-`, query)
-	}
-
-	// If FTS fails or is not available, fall back to LIKE
-	if !db.hasFTS || err != nil {
+		ftsMatchClause = ` JOIN entities_fts fts ON fts.rowid = e.id WHERE entities_fts MATCH ? `
+		orderByClause = ` ORDER BY rank LIMIT ? `
+		finalQueryArgs = append(finalQueryArgs, query, limit)
+	} else {
 		keywords := strings.Fields(strings.ToLower(query))
-
-		var whereClause strings.Builder
-		whereClause.WriteString("WHERE ")
-
-		for i, keyword := range keywords {
-			if i > 0 {
-				whereClause.WriteString(" OR ")
-			}
-			whereClause.WriteString(fmt.Sprintf("(LOWER(e.name) LIKE '%%%s%%' OR LOWER(e.description) LIKE '%%%s%%' OR LOWER(e.content) LIKE '%%%s%%')", keyword, keyword, keyword))
+		if len(keywords) == 0 {
+			return []parsers.Entity{}, nil
 		}
-
-		// Execute fallback query
-		rows, err = db.conn.Query(fmt.Sprintf(`
-SELECT e.type, e.name, e.signature, e.line_start, e.line_end, e.content, e.description, f.path
-FROM entities e
-JOIN files f ON e.file_id = f.id
-%s
-LIMIT 10`, whereClause.String()))
-		if err != nil {
-			return nil, err
+		var whereConditions []string
+		for _, keyword := range keywords {
+			likeKeyword := "%" + keyword + "%"
+			whereConditions = append(whereConditions, "(LOWER(e.name) LIKE ? OR LOWER(e.description) LIKE ? OR LOWER(e.content) LIKE ? OR LOWER(e.package_context) LIKE ? OR LOWER(e.receiver_type) LIKE ?)")
+			finalQueryArgs = append(finalQueryArgs, likeKeyword, likeKeyword, likeKeyword, likeKeyword, likeKeyword)
 		}
+		ftsMatchClause = fmt.Sprintf(" WHERE %s ", strings.Join(whereConditions, " OR "))
+		orderByClause = ` ORDER BY e.id DESC LIMIT ? `
+		finalQueryArgs = append(finalQueryArgs, limit)
 	}
 
+	fullQueryString := baseSelect + ftsMatchClause + orderByClause
+	rows, err = db.conn.Query(fullQueryString, finalQueryArgs...)
+	if err != nil {
+		if db.hasFTS {
+			fmt.Printf("FTS query failed ('%s'), falling back to LIKE: %v\n", query, err)
+
+			keywords := strings.Fields(strings.ToLower(query))
+			if len(keywords) == 0 {
+				return []parsers.Entity{}, nil
+			}
+			var whereConditions []string
+			var args []interface{}
+			for _, keyword := range keywords {
+				likeKeyword := "%" + keyword + "%"
+				whereConditions = append(whereConditions, "(LOWER(e.name) LIKE ? OR LOWER(e.description) LIKE ? OR LOWER(e.content) LIKE ? OR LOWER(e.package_context) LIKE ? OR LOWER(e.receiver_type) LIKE ?)")
+				args = append(args, likeKeyword, likeKeyword, likeKeyword, likeKeyword, likeKeyword)
+			}
+			args = append(args, limit)
+
+			fallbackQueryString := fmt.Sprintf(`
+				SELECT e.type, e.name, e.signature, e.line_start, e.line_end, e.content, e.description, f.path,
+					   e.package_context, e.receiver_type, e.signature_json, e.ast_metadata_json, e.param_count, e.return_count
+				FROM entities e
+				JOIN files f ON e.file_id = f.id
+				WHERE %s
+				ORDER BY e.id DESC
+				LIMIT ?`, strings.Join(whereConditions, " OR "))
+
+			rows, err = db.conn.Query(fallbackQueryString, args...)
+			if err != nil {
+				return nil, fmt.Errorf("fallback LIKE query failed: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("query failed: %w", err)
+		}
+	}
 	defer rows.Close()
 
-	var entities []parsers.Entity
+	var resultEntities []parsers.Entity
 	for rows.Next() {
-		var e parsers.Entity
-		var path string
-		if err := rows.Scan(&e.Type, &e.Name, &e.Signature, &e.LineStart, &e.LineEnd, &e.Content, &e.Description, &path); err != nil {
-			return nil, err
+		var pe parsers.Entity
+
+		var path, packageContext, receiverType, signatureJSON, astMetadataJSON sql.NullString
+		var signature, description sql.NullString
+		var paramCount, returnCount sql.NullInt64
+
+		scanArgs := []interface{}{
+			&pe.Type, &pe.Name, &signature, &pe.LineStart, &pe.LineEnd,
+			&pe.Content, &description, &path, &packageContext, &receiverType,
+			&signatureJSON, &astMetadataJSON, &paramCount, &returnCount,
 		}
-		// Add file path to description for context
-		if e.Description != "" {
-			e.Description += "\n\n"
+
+		if db.hasFTS && strings.Contains(strings.ToLower(fullQueryString), "fts.rank") {
 		}
-		e.Description += fmt.Sprintf("File: %s", path)
-		entities = append(entities, e)
+
+		if errScan := rows.Scan(scanArgs...); errScan != nil {
+			return nil, fmt.Errorf("scanning entity row: %w", errScan)
+		}
+
+		pe.Signature = signature.String
+		pe.Description = description.String
+
+		descBuilder := strings.Builder{}
+		if pe.Description != "" {
+			descBuilder.WriteString(pe.Description)
+		}
+
+		filePath := path.String
+		if filePath != "" {
+			if descBuilder.Len() > 0 {
+				descBuilder.WriteString("\n")
+			}
+			descBuilder.WriteString(fmt.Sprintf("File: %s", filePath))
+		}
+		if packageContext.Valid && packageContext.String != "" {
+			if descBuilder.Len() > 0 {
+				descBuilder.WriteString("\n")
+			}
+			descBuilder.WriteString(fmt.Sprintf("Package: %s", packageContext.String))
+		}
+		if receiverType.Valid && receiverType.String != "" {
+			if descBuilder.Len() > 0 {
+				descBuilder.WriteString("\n")
+			}
+			descBuilder.WriteString(fmt.Sprintf("Receiver: %s", receiverType.String))
+		}
+
+		pe.Description = descBuilder.String()
+		resultEntities = append(resultEntities, pe)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration error: %w", err)
 	}
 
-	return entities, nil
+	return resultEntities, nil
 }
 
-// GetStats returns database statistics
 func (db *DB) GetStats() (map[string]int, error) {
 	stats := make(map[string]int)
 
-	// Count files
-	var fileCount int
-	err := db.conn.QueryRow("SELECT COUNT(*) FROM files").Scan(&fileCount)
-	if err != nil {
-		return nil, err
-	}
-	stats["files"] = fileCount
-
-	// Count entities
-	var entityCount int
-	err = db.conn.QueryRow("SELECT COUNT(*) FROM entities").Scan(&entityCount)
-	if err != nil {
-		return nil, err
-	}
-	stats["entities"] = entityCount
-
-	// Count by entity type
-	rows, err := db.conn.Query("SELECT type, COUNT(*) FROM entities GROUP BY type")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var entityType string
+	countQuery := func(tableName string) (int, error) {
 		var count int
-		if err := rows.Scan(&entityType, &count); err != nil {
-			return nil, err
-		}
-		stats["type_"+entityType] = count
+		err := db.conn.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)).Scan(&count)
+		return count, err
 	}
 
-	// Count by language
-	rows, err = db.conn.Query("SELECT language, COUNT(*) FROM files GROUP BY language")
+	var err error
+	stats["files"], err = countQuery("files")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("count files: %w", err)
 	}
-	defer rows.Close()
 
-	for rows.Next() {
-		var language string
-		var count int
-		if err := rows.Scan(&language, &count); err != nil {
-			return nil, err
+	stats["entities"], err = countQuery("entities")
+	if err != nil {
+		return nil, fmt.Errorf("count entities: %w", err)
+	}
+
+	stats["whole_files"], err = countQuery("whole_files")
+	if err != nil {
+		return nil, fmt.Errorf("count whole_files: %w", err)
+	}
+
+	stats["file_imports"], err = countQuery("file_imports")
+	if err != nil {
+		return nil, fmt.Errorf("count file_imports: %w", err)
+	}
+
+	stats["entity_relationships"], err = countQuery("entity_relationships")
+	if err != nil {
+		return nil, fmt.Errorf("count entity_relationships: %w", err)
+	}
+
+	groupQuery := func(table, groupColumn, prefix string) error {
+		rows, errGroup := db.conn.Query(fmt.Sprintf("SELECT %s, COUNT(*) FROM %s GROUP BY %s", groupColumn, table, groupColumn))
+		if errGroup != nil {
+			return errGroup
 		}
-		stats["lang_"+language] = count
+		defer rows.Close()
+		for rows.Next() {
+			var value string
+			var count int
+			if errScan := rows.Scan(&value, &count); errScan != nil {
+				return errScan
+			}
+			stats[prefix+value] = count
+		}
+		return rows.Err()
+	}
+
+	if err = groupQuery("entities", "type", "type_"); err != nil {
+		return nil, fmt.Errorf("count entities by type: %w", err)
+	}
+
+	if err = groupQuery("files", "language", "lang_"); err != nil {
+		return nil, fmt.Errorf("count files by language: %w", err)
+	}
+
+	if err = groupQuery("entity_relationships", "relationship_type", "relationship_"); err != nil {
+		return nil, fmt.Errorf("count relationships by type: %w", err)
 	}
 
 	return stats, nil
@@ -285,13 +617,18 @@ func (db *DB) StoreWholeFile(path, language string, modTime int64, content strin
 		"INSERT OR REPLACE INTO whole_files (path, language, last_modified, content) VALUES (?, ?, ?, ?)",
 		path, language, modTime, content,
 	)
-	return err
+	if err != nil {
+		return fmt.Errorf("store whole file %s: %w", path, err)
+	}
+	return nil
 }
 
 func (db *DB) FindRelevantFiles(query string, limit int) ([]map[string]interface{}, error) {
 	keywords := strings.Fields(strings.ToLower(query))
+	if len(keywords) == 0 {
+		return []map[string]interface{}{}, nil
+	}
 
-	// Build a SELECT query with relevance scoring
 	var sb strings.Builder
 	sb.WriteString(`
         WITH relevance AS (
@@ -301,30 +638,29 @@ func (db *DB) FindRelevantFiles(query string, limit int) ([]map[string]interface
                 wf.content,
                 (`)
 
-	// Add scoring criteria
+	var queryParams []interface{}
 	for i, keyword := range keywords {
 		if i > 0 {
 			sb.WriteString(" + ")
 		}
+		likeKeyword := "%" + keyword + "%"
 
-		escapedKeyword := strings.ReplaceAll(keyword, "'", "''")
+		sb.WriteString(` CASE WHEN LOWER(wf.path) LIKE ? THEN 3.0 ELSE 0.0 END `)
+		queryParams = append(queryParams, likeKeyword)
 
-		// Path matches are highly relevant (x3)
-		sb.WriteString(fmt.Sprintf(`
-            CASE WHEN LOWER(wf.path) LIKE '%%%s%%' THEN 3 ELSE 0 END +`, escapedKeyword))
+		sb.WriteString(` + (SELECT 5.0 * COUNT(*) FROM entities e JOIN files f ON e.file_id = f.id WHERE f.path = wf.path AND (LOWER(e.name) LIKE ? OR LOWER(e.description) LIKE ? ))`)
+		queryParams = append(queryParams, likeKeyword, likeKeyword)
 
-		// Entity name matches are very relevant (x5)
-		sb.WriteString(fmt.Sprintf(`
-            (SELECT 5 * COUNT(*) FROM entities e
-             JOIN files f ON e.file_id = f.id
-             WHERE f.path = wf.path AND LOWER(e.name) LIKE '%%%s%%')`, escapedKeyword))
+		escapedKeywordForLen := keyword
+		if len(escapedKeywordForLen) == 0 {
+			escapedKeywordForLen = " "
+		}
+		sb.WriteString(` + (CAST(LENGTH(LOWER(wf.content)) - LENGTH(REPLACE(LOWER(wf.content), ?, '')) AS REAL) / LENGTH(?))`)
+		queryParams = append(queryParams, keyword, escapedKeywordForLen)
 
-		// Content matches count but less heavily
-		sb.WriteString(fmt.Sprintf(`
-            + (LENGTH(LOWER(wf.content)) - LENGTH(REPLACE(LOWER(wf.content), '%s', ''))) / LENGTH('%s')`, escapedKeyword, escapedKeyword))
 	}
+	queryParams = append(queryParams, limit)
 
-	// Complete the query
 	sb.WriteString(`
             ) AS score
         FROM whole_files wf
@@ -332,43 +668,43 @@ func (db *DB) FindRelevantFiles(query string, limit int) ([]map[string]interface
         ORDER BY score DESC
         LIMIT ?
     )
-    SELECT path, language, content FROM relevance
+    SELECT path, language, content FROM relevance WHERE path IS NOT NULL AND language IS NOT NULL AND content IS NOT NULL
     `)
 
-	// Execute the query
-	rows, err := db.conn.Query(sb.String(), limit)
+	rows, err := db.conn.Query(sb.String(), queryParams...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("querying relevant files: %w", err)
 	}
 	defer rows.Close()
 
 	var files []map[string]interface{}
-
 	for rows.Next() {
 		var path, language, content string
 		if err := rows.Scan(&path, &language, &content); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scanning relevant file row: %w", err)
 		}
-
 		files = append(files, map[string]interface{}{
 			"path":     path,
 			"language": language,
 			"content":  content,
 		})
 	}
-
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration error for relevant files: %w", err)
+	}
 	return files, nil
 }
 
 func (db *DB) FindRelatedEntities(filePath string) ([]parsers.Entity, error) {
-	// Get file ID
-	var fileID int
+	var fileID int64
 	err := db.conn.QueryRow("SELECT id FROM files WHERE path = ?", filePath).Scan(&fileID)
 	if err != nil {
-		return nil, err
+		if err == sql.ErrNoRows {
+			return []parsers.Entity{}, nil
+		}
+		return nil, fmt.Errorf("find file id for related entities '%s': %w", filePath, err)
 	}
 
-	// Find entities in the same file
 	rows, err := db.conn.Query(`
         SELECT e.type, e.name, e.signature, e.line_start, e.line_end, e.content, e.description
         FROM entities e
@@ -376,114 +712,197 @@ func (db *DB) FindRelatedEntities(filePath string) ([]parsers.Entity, error) {
         ORDER BY e.line_start
         LIMIT 5`, fileID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("query related entities for file_id %d: %w", fileID, err)
 	}
 	defer rows.Close()
 
 	var entities []parsers.Entity
 	for rows.Next() {
 		var e parsers.Entity
-		if err := rows.Scan(&e.Type, &e.Name, &e.Signature, &e.LineStart, &e.LineEnd, &e.Content, &e.Description); err != nil {
-			return nil, err
+		var signature, description sql.NullString
+		if err := rows.Scan(&e.Type, &e.Name, &signature, &e.LineStart, &e.LineEnd, &e.Content, &description); err != nil {
+			return nil, fmt.Errorf("scanning related entity row: %w", err)
 		}
+		e.Signature = signature.String
+		e.Description = description.String
 		entities = append(entities, e)
 	}
-
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration error for related entities: %w", err)
+	}
 	return entities, nil
 }
 
-// ChunkedCodeSection represents a section of code with relevance information
 type ChunkedCodeSection struct {
 	Path      string
 	Language  string
 	Content   string
 	StartLine int
 	EndLine   int
-	Score     int
+	Score     float64
 }
 
-// FindRelevantCodeSections finds relevant sections of code rather than whole files
 func (db *DB) FindRelevantCodeSections(query string, limit int) ([]ChunkedCodeSection, error) {
 	keywords := strings.Fields(strings.ToLower(query))
-
-	// Build query conditions with the correct number of placeholders
-	var conditions []string
-	var params []interface{}
-
-	for _, keyword := range keywords {
-		escapedKeyword := "%" + strings.ToLower(keyword) + "%"
-		conditions = append(conditions, "(LOWER(e.name) LIKE ? OR LOWER(e.content) LIKE ?)")
-		params = append(params, escapedKeyword, escapedKeyword)
+	if len(keywords) == 0 {
+		return []ChunkedCodeSection{}, nil
 	}
 
-	// If no keywords, use a default condition that matches everything
-	if len(conditions) == 0 {
-		conditions = append(conditions, "1=1")
+	var queryBuilder strings.Builder
+	var queryArgs []interface{}
+
+	actualLimit := limit
+	if actualLimit <= 0 {
+		actualLimit = 5
+	}
+	queryLimit := actualLimit * 5
+
+	selectClause := `
+		SELECT
+			e.id, e.name, e.type, e.line_start, e.line_end,
+			f.path, f.language,
+			(SELECT wf.content FROM whole_files wf WHERE wf.path = f.path LIMIT 1) as file_content`
+
+	fromClause := `
+		FROM entities e
+		JOIN files f ON e.file_id = f.id`
+
+	var whereSubClause string
+	var orderByClause string
+
+	if db.hasFTS {
+		queryBuilder.WriteString(selectClause)
+		queryBuilder.WriteString(", fts.rank AS score")
+		queryBuilder.WriteString(`
+			FROM entities_fts fts
+			JOIN entities e ON fts.rowid = e.id
+			JOIN files f ON e.file_id = f.id
+			WHERE entities_fts MATCH ? `)
+		orderByClause = "ORDER BY score"
+		queryArgs = append(queryArgs, query)
+	} else {
+		queryBuilder.WriteString(selectClause)
+		queryBuilder.WriteString(", 10.0 AS score")
+		queryBuilder.WriteString(fromClause)
+
+		var conditions []string
+		for _, keyword := range keywords {
+			likeKeyword := "%" + keyword + "%"
+			conditions = append(conditions, "(LOWER(e.name) LIKE ? OR LOWER(e.content) LIKE ? OR LOWER(e.description) LIKE ? OR LOWER(e.package_context) LIKE ? OR LOWER(e.receiver_type) LIKE ?)")
+			queryArgs = append(queryArgs, likeKeyword, likeKeyword, likeKeyword, likeKeyword, likeKeyword)
+		}
+		if len(conditions) == 0 {
+			return []ChunkedCodeSection{}, nil
+		}
+		whereSubClause = "WHERE (" + strings.Join(conditions, " OR ") + ")"
+		orderByClause = "ORDER BY e.name, e.line_start"
 	}
 
-	// Build the query
-	query = `
-        SELECT
-            e.id, e.name, e.type, e.line_start, e.line_end,
-            f.path, f.language,
-            (SELECT content FROM whole_files WHERE path = f.path) as file_content
-        FROM entities e
-        JOIN files f ON e.file_id = f.id
-        WHERE ` + strings.Join(conditions, " OR ") + `
-        ORDER BY e.id DESC
-        LIMIT ?`
+	queryBuilder.WriteString(" ")
+	queryBuilder.WriteString(whereSubClause)
+	queryBuilder.WriteString(" ")
+	queryBuilder.WriteString(orderByClause)
+	queryBuilder.WriteString(" LIMIT ?")
+	queryArgs = append(queryArgs, queryLimit)
 
-	// Add the limit parameter
-	params = append(params, limit*3) // Get more entities than needed for filtering
-
-	// Execute the query with the correct number of parameters
-	rows, err := db.conn.Query(query, params...)
+	rows, err := db.conn.Query(queryBuilder.String(), queryArgs...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("querying relevant entities for sections build query '%s': %w", queryBuilder.String(), err)
 	}
 	defer rows.Close()
 
-	// Process entities into code sections
 	var sections []ChunkedCodeSection
-	processedFiles := make(map[string]bool)
+
+	processedFileAndEntityStartLine := make(map[string]bool)
 
 	for rows.Next() {
 		var id int
 		var name, entityType string
 		var lineStart, lineEnd int
-		var path, language, fileContent string
+		var path, language string
+		var fileContentRaw sql.NullString
+		var score float64
 
-		err := rows.Scan(&id, &name, &entityType, &lineStart, &lineEnd, &path, &language, &fileContent)
+		err := rows.Scan(&id, &name, &entityType, &lineStart, &lineEnd, &path, &language, &fileContentRaw, &score)
 		if err != nil {
-			return nil, err
-		}
-
-		// Don't process the same file twice
-		if processedFiles[path] {
+			log.Printf("Warning: scanning section row failed: %v", err)
 			continue
 		}
 
-		// Split the file content into lines
+		if !fileContentRaw.Valid || fileContentRaw.String == "" {
+			continue
+		}
+		fileContent := fileContentRaw.String
+
+		entityMapKey := fmt.Sprintf("%s-%d", path, lineStart)
+		if processedFileAndEntityStartLine[entityMapKey] {
+			continue
+		}
+
 		lines := strings.Split(fileContent, "\n")
-
-		// Add some context lines before and after
 		contextLines := 5
-		effectiveStart := max(0, lineStart-contextLines-1)
-		effectiveEnd := min(len(lines), lineEnd+contextLines)
 
-		// Extract the relevant section with context
-		sectionLines := lines[effectiveStart:effectiveEnd]
+		dbLineStart := lineStart
+		dbLineEnd := lineEnd
+
+		if dbLineStart <= 0 {
+			dbLineStart = 1
+		}
+		if dbLineEnd <= 0 {
+			dbLineEnd = dbLineStart
+		}
+		if dbLineEnd < dbLineStart {
+			dbLineEnd = dbLineStart
+		}
+
+		effectiveStart := max(0, dbLineStart-1-contextLines)
+		effectiveEnd := min(len(lines), dbLineEnd+contextLines)
+
+		if effectiveStart >= len(lines) {
+			effectiveStart = len(lines) - 1
+		}
+		if effectiveEnd > len(lines) {
+			effectiveEnd = len(lines)
+		}
+		if effectiveStart < 0 {
+			effectiveStart = 0
+		}
+
+		if effectiveStart >= effectiveEnd {
+			if dbLineStart-1 < len(lines) && dbLineStart-1 >= 0 {
+				effectiveStart = dbLineStart - 1
+			} else {
+				effectiveStart = 0
+			}
+			if dbLineEnd <= len(lines) && dbLineEnd >= effectiveStart {
+				effectiveEnd = dbLineEnd
+			} else {
+				effectiveEnd = effectiveStart
+			}
+		}
+
+		var sectionLines []string
+		if effectiveStart < effectiveEnd {
+			sectionLines = lines[effectiveStart:effectiveEnd]
+		} else if effectiveStart < len(lines) {
+			sectionLines = []string{lines[effectiveStart]}
+			effectiveEnd = effectiveStart + 1
+		}
+
 		sectionContent := strings.Join(sectionLines, "\n")
 
-		// Calculate score based on keyword matches
-		score := 10 // Base score for being an entity match
-		for _, keyword := range keywords {
-			if strings.Contains(strings.ToLower(name), strings.ToLower(keyword)) {
-				score += 5 // Bonus for name match
+		if !db.hasFTS {
+			calculatedScore := 10.0
+			for _, keyword := range keywords {
+				if strings.Contains(strings.ToLower(name), keyword) {
+					calculatedScore += 50.0
+				}
+				if strings.Contains(strings.ToLower(entityType), keyword) {
+					calculatedScore += 20.0
+				}
+				calculatedScore += float64(strings.Count(strings.ToLower(sectionContent), keyword)) * 1.0
 			}
-			if strings.Contains(strings.ToLower(sectionContent), strings.ToLower(keyword)) {
-				score += 2 // Bonus for content match
-			}
+			score = calculatedScore
 		}
 
 		sections = append(sections, ChunkedCodeSection{
@@ -494,24 +913,56 @@ func (db *DB) FindRelevantCodeSections(query string, limit int) ([]ChunkedCodeSe
 			EndLine:   effectiveEnd,
 			Score:     score,
 		})
+		processedFileAndEntityStartLine[entityMapKey] = true
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration error for sections: %w", err)
+	}
 
-		processedFiles[path] = true
+	sort.Slice(sections, func(i, j int) bool {
+		if sections[i].Score != sections[j].Score {
+			return sections[i].Score > sections[j].Score
+		}
+		if sections[i].Path != sections[j].Path {
+			return sections[i].Path < sections[j].Path
+		}
+		return sections[i].StartLine < sections[j].StartLine
+	})
 
-		// Limit the number of files processed
-		if len(sections) >= limit {
+	finalSections := []ChunkedCodeSection{}
+	uniquePaths := make(map[string]bool)
+	for _, s := range sections {
+		if len(finalSections) >= actualLimit {
+			if !uniquePaths[s.Path] {
+			} else {
+				continue
+			}
+		}
+		if !uniquePaths[s.Path] {
+			finalSections = append(finalSections, s)
+			uniquePaths[s.Path] = true
+		} else {
+			for idx, existingSection := range finalSections {
+				if existingSection.Path == s.Path {
+					if s.Score > existingSection.Score {
+						finalSections[idx] = s
+					}
+					break
+				}
+			}
+		}
+		if len(finalSections) >= actualLimit && len(uniquePaths) >= actualLimit {
 			break
 		}
 	}
 
-	// Sort sections by score
-	sort.Slice(sections, func(i, j int) bool {
-		return sections[i].Score > sections[j].Score
-	})
+	if len(finalSections) > actualLimit {
+		finalSections = finalSections[:actualLimit]
+	}
 
-	return sections, nil
+	return finalSections, nil
 }
 
-// Helper functions
 func max(a, b int) int {
 	if a > b {
 		return a
@@ -520,8 +971,8 @@ func max(a, b int) int {
 }
 
 func min(a, b int) int {
-	if a > b {
-		return b
+	if a < b {
+		return a
 	}
-	return a
+	return b
 }

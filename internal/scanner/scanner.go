@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/txarli-san/codeassist/internal/scanner/parsers"
 	"github.com/txarli-san/codeassist/internal/storage"
@@ -43,6 +44,7 @@ func ScanDirectory(rootDir, languages string, db *storage.DB) error {
 		entitiesFound int
 		errors        int
 	}
+	startTime := time.Now()
 
 	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -53,34 +55,50 @@ func ScanDirectory(rootDir, languages string, db *storage.DB) error {
 
 		if info.IsDir() {
 			basename := filepath.Base(path)
-			if basename == ".git" || basename == "node_modules" || basename == "vendor" || basename == ".bundle" {
-				fmt.Printf("Skipping directory: %s\n", path)
+			if strings.HasPrefix(basename, ".") && basename != "." && basename != ".." {
+				return filepath.SkipDir
+			}
+			if basename == "node_modules" || basename == "vendor" || basename == ".bundle" || basename == "target" || basename == "build" || basename == "dist" || basename == "pkg" || basename == "tmp" || basename == "temp" {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
-		ext := strings.TrimPrefix(filepath.Ext(path), ".")
-		originalExt := ext
-
-		if strings.HasSuffix(path, ".html.erb") {
-			ext = "html"
-		} else if strings.HasSuffix(path, ".jsx") || strings.HasSuffix(path, ".tsx") {
-			ext = "js"
-		} else if strings.HasSuffix(path, ".rake") || strings.HasSuffix(path, ".gemspec") {
-			ext = "rb"
+		if info.Size() == 0 {
+			return nil
 		}
 
-		if !langMap[ext] {
-			if originalExt == "htm" && langMap["html"] {
-				ext = "html"
-			} else if (originalExt == "jsx" || originalExt == "tsx") && langMap["js"] {
-				ext = "js"
-			} else if (originalExt == "rake" || originalExt == "gemspec") && langMap["rb"] {
-				ext = "rb"
-			} else {
-				return nil
+		if info.Size() > 2*1024*1024 {
+			fmt.Printf("Skipping large file ( > 2MB ): %s\n", path)
+			return nil
+		}
+
+		ext := strings.TrimPrefix(filepath.Ext(path), ".")
+
+		langToUse := ""
+
+		switch strings.ToLower(ext) {
+		case "go":
+			langToUse = "go"
+		case "rb", "rake", "gemspec", "ru", "erb":
+			langToUse = "rb"
+		case "js", "jsx", "mjs", "cjs":
+			langToUse = "js"
+		case "ts", "tsx":
+			langToUse = "js"
+		case "html", "htm":
+			langToUse = "html"
+		}
+
+		baseName := strings.ToLower(filepath.Base(path))
+		if langToUse == "" {
+			if baseName == "rakefile" || baseName == "gemfile" {
+				langToUse = "rb"
 			}
+		}
+
+		if langToUse == "" || !langMap[langToUse] {
+			return nil
 		}
 
 		contentBytes, err := os.ReadFile(path)
@@ -91,16 +109,19 @@ func ScanDirectory(rootDir, languages string, db *storage.DB) error {
 		}
 		contentStr := string(contentBytes)
 
-		fmt.Printf("Scanning file: %s (lang: %s)\n", path, ext)
 		stats.filesScanned++
+		if stats.filesScanned%100 == 0 {
+			fmt.Printf("Scanned %d files...\n", stats.filesScanned)
+		}
 
-		if err := db.StoreWholeFile(path, ext, info.ModTime().Unix(), contentStr); err != nil {
+		if err := db.StoreWholeFile(path, langToUse, info.ModTime().Unix(), contentStr); err != nil {
 			fmt.Printf("Warning: Could not store whole file %s: %v\n", path, err)
 			stats.errors++
+
 		}
 
 		var parser parsers.Parser
-		switch ext {
+		switch langToUse {
 		case "go":
 			parser = &parsers.GoParser{}
 		case "rb":
@@ -113,7 +134,13 @@ func ScanDirectory(rootDir, languages string, db *storage.DB) error {
 			return nil
 		}
 
+		parseStartTime := time.Now()
 		richEntities, err := parser.Parse(path, contentStr)
+		parseDuration := time.Since(parseStartTime)
+		if parseDuration > 500*time.Millisecond {
+			fmt.Printf("Slow parse for %s: %v\n", path, parseDuration)
+		}
+
 		if err != nil {
 			fmt.Printf("Warning: Could not parse %s: %v\n", path, err)
 			stats.errors++
@@ -122,12 +149,7 @@ func ScanDirectory(rootDir, languages string, db *storage.DB) error {
 
 		stats.entitiesFound += len(richEntities)
 
-		var plainEntities []parsers.Entity
-		for _, re := range richEntities {
-			plainEntities = append(plainEntities, re.Entity)
-		}
-
-		if err := db.StoreFileAndEntities(path, ext, info.ModTime().Unix(), len(contentBytes), plainEntities); err != nil {
+		if err := db.StoreFileAndEntities(path, langToUse, info.ModTime().Unix(), len(contentBytes), richEntities); err != nil {
 			fmt.Printf("Warning: Could not store entities for %s: %v\n", path, err)
 			stats.errors++
 		}
@@ -135,10 +157,12 @@ func ScanDirectory(rootDir, languages string, db *storage.DB) error {
 		return nil
 	})
 
+	duration := time.Since(startTime)
 	fmt.Printf("\nScan complete!\n")
-	fmt.Printf("Files scanned: %d\n", stats.filesScanned)
-	fmt.Printf("Entities found: %d\n", stats.entitiesFound)
+	fmt.Printf("Total files scanned: %d\n", stats.filesScanned)
+	fmt.Printf("Total entities found: %d\n", stats.entitiesFound)
 	fmt.Printf("Errors encountered: %d\n", stats.errors)
+	fmt.Printf("Scan duration: %s\n", duration)
 
 	return err
 }
